@@ -7,7 +7,7 @@ $OutputPath = 'C:\Audit\AD_Protocol_Dependency_Map_7Days_' + $Date + '.xlsx'
 # Dynamically gather all Domain Controllers in the current forest/domain
 $DCs = (Get-ADDomainController -Filter *).HostName
 
-# Calculate lookback time window safely outside the string query
+# Calculate lookback time window (7 Days) safely
 $DaysToLookBack = -7
 $StartTime = (Get-Date).AddDays($DaysToLookBack)
 $UniversalTimeString = $StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
@@ -15,7 +15,7 @@ $UniversalTimeString = $StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:s
 # Construct the XPath query using literal concatenation to prevent string parsing errors
 $XPathQuery = '*[System[(EventID=4624 or EventID=4769) and TimeCreated[@SystemTime >= ' + "'" + $UniversalTimeString + "'" + ']]]'
 
-Write-Host 'Compiling Big-Picture AD Dependency Map...' -ForegroundColor Green
+Write-Host 'Compiling Big-Picture AD Dependency Map (Streaming Mode)...' -ForegroundColor Green
 $MasterDependencyList = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 # Encryption Type Translation Table
@@ -28,43 +28,35 @@ $CryptoTable = @{
 }
 
 # ==========================================================================================
-# LOG AGGREGATION & TRACKING
+# LOG AGGREGATION & REAL-TIME STREAMING
 # ==========================================================================================
 foreach ($DC in $DCs) {
-    $StatusMessage = 'Gathering logs from ' + $DC + '...'
+    $StatusMessage = 'Opening stream to ' + $DC + '...'
     Write-Host $StatusMessage -ForegroundColor Cyan
     
     try {
-        # Fetch the security event logs from the specific DC
-        $Events = Get-WinEvent -ComputerName $DC -LogName 'Security' -FilterXPath $XPathQuery -ErrorAction SilentlyContinue
-        if (-not $Events) { 
-            Write-Host 'No events found on ' + $DC -ForegroundColor Yellow
-            continue 
-        }
-
-        # Initialize progress tracker counter for this specific DC
+        # Initialize the streaming counter
         $Counter = 0
-        $TotalEventsForThisDC = $Events.Count
 
-        foreach ($Evt in $Events) {
+        # Piping Get-WinEvent directly into ForEach-Object processes logs in real-time
+        Get-WinEvent -ComputerName $DC -LogName 'Security' -FilterXPath $XPathQuery -ErrorAction SilentlyContinue | ForEach-Object {
             $Counter++
 
-            # Update progress bar UI every 1,000 events processed
-            if ($Counter % 1000 -eq 0) {
-                $Percent = [int](($Counter / $TotalEventsForThisDC) * 100)
+            # Update progress bar UI every 500 events processed
+            if ($Counter % 500 -eq 0) {
                 Write-Progress `
-                    -Activity ('Processing events on ' + $DC) `
-                    -Status ('Events parsed: ' + $Counter + ' / ' + $TotalEventsForThisDC) `
-                    -PercentComplete $Percent
+                    -Activity ('Streaming and parsing events from ' + $DC) `
+                    -Status ('Total events intercepted so far: ' + $Counter) `
+                    -PercentComplete -1 # Stream mode uses -1 since total size is calculated dynamically
             }
 
-            $EventXML = [xml]$Evt.ToXml()
+            $EventXML = [xml]$_.ToXml()
             $Data = $EventXML.Event.EventData.Data
 
             # ------------------------------------------------------------------------------
             # INTERCEPT NTLM TRACKING (Event ID 4624)
             # ------------------------------------------------------------------------------
-            if ($Evt.Id -eq 4624) {
+            if ($_.Id -eq 4624) {
                 $AuthPackage = ($Data | Where-Object { $_.Name -eq 'AuthenticationPackageName' }).'#text'
                 
                 if ($AuthPackage -eq 'NTLM') {
@@ -86,10 +78,9 @@ foreach ($DC in $DCs) {
             # ------------------------------------------------------------------------------
             # INTERCEPT KERBEROS TRACKING (Event ID 4769)
             # ------------------------------------------------------------------------------
-            elseif ($Evt.Id -eq 4769) {
+            elseif ($_.Id -eq 4769) {
                 $TargetService = ($Data | Where-Object { $_.Name -eq 'ServiceName' }).'#text'
                 
-                # Ignore automated computer account self-updates to isolate real app targets
                 if ($TargetService -and $TargetService -notlike '*$') {
                     $RawIP      = ($Data | Where-Object { $_.Name -eq 'IpAddress' }).'#text'
                     $ClientIP   = $RawIP -replace '::ffff:', ''
@@ -111,11 +102,12 @@ foreach ($DC in $DCs) {
             }
         }
         
-        # Clear the progress bar for the current DC before looping to the next
-        Write-Progress -Activity ('Processing events on ' + $DC) -Completed
+        # Clear the progress bar for this specific DC
+        Write-Progress -Activity ('Streaming and parsing events from ' + $DC) -Completed
+        Write-Host ('Finished streaming ' + $Counter + ' events from ' + $DC + '.') -ForegroundColor Green
         
     } catch {
-        $ErrorMessage = 'Could not process logs on ' + $DC + '. Error: ' + $_.Exception.Message
+        $ErrorMessage = 'Could not process stream on ' + $DC + '. Error: ' + $_.Exception.Message
         Write-Warning $ErrorMessage
     }
 }
@@ -144,7 +136,7 @@ $UniqueDependencies = $MasterDependencyList |
 # EXPORT TO EXCEL
 # ==========================================================================================
 if ($UniqueDependencies) {
-    # Ensure directory path exists
+    # Ensure local directory path exists before saving
     $TargetFolder = Split-Path -Path $OutputPath -Parent
     if (-not (Test-Path $TargetFolder)) { New-Item -ItemType Directory -Path $TargetFolder -Force | Out-Null }
 
